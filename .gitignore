@@ -21,6 +21,9 @@ work/
 *.aab
 *.apks
 
+# Local unit tests and diagnostic tools
+/local-tests/
+
 # Local signing material
 *.jks
 *.keystore
@@ -33,3 +36,4 @@ hs_err_pid*
 Thumbs.db
 desktop.ini
 .vscode/settings.json
+AGENTS.md

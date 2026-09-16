@@ -51,17 +51,23 @@ final class ArkSendHook {
         public void beforeHookedMember(HookBridge.MemberHookParam param) {
             if (!AnonState.isArmed()) return;
             boolean changed = false;
+            boolean knownAnonymous = false;
+            boolean needsUploadProof = false;
             for (Object argument : param.getArgs()) {
                 if (!(argument instanceof List<?> elements)) continue;
                 for (Object element : elements) {
                     if (element == null) continue;
-                    changed |= sanitizeArkElement(element);
-                    changed |= sanitizeXmlElement(element, "getMultiForwardMsgElement");
-                    changed |= sanitizeXmlElement(element, "getStructMsgElement");
+                    boolean known = knownAnonymousElement(element);
+                    knownAnonymous |= known;
+                    boolean updated = sanitizeArkElement(element);
+                    updated |= sanitizeXmlElement(element, "getMultiForwardMsgElement");
+                    updated |= sanitizeXmlElement(element, "getStructMsgElement");
+                    changed |= updated;
+                    needsUploadProof |= updated && !known;
                 }
             }
-            if (changed) {
-                if (!AnonState.hasSanitizedPacket()) {
+            if (changed || knownAnonymous) {
+                if (!AnonState.hasSanitizedPacket() && needsUploadProof) {
                     AFLog.w("Blocked multimsg card because no SsoSendLongMsg packet was sanitized");
                     param.setResult(null);
                     AnonState.disarm();
@@ -69,6 +75,18 @@ final class ArkSendHook {
                 }
                 param.setExtra(Boolean.TRUE);
             }
+        }
+
+        private static boolean knownAnonymousElement(Object element) {
+            for (String getter : new String[]{"getArkElement", "getMultiForwardMsgElement", "getStructMsgElement"}) {
+                try {
+                    Object rich = Reflect.call(element, getter);
+                    if (rich == null) continue;
+                    String payload = String.valueOf(Reflect.call(rich, getter.equals("getArkElement") ? "getBytesData" : "getXmlContent"));
+                    if (ForwardCacheHook.knownAnonymousPayload(payload)) return true;
+                } catch (ReflectiveOperationException ignored) {}
+            }
+            return false;
         }
 
         @Override

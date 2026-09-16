@@ -23,6 +23,7 @@ final class AnonState {
     private static long stateFileModified;
     private static int aliasCounter;
     private static boolean forwardNoticeShown;
+    private static long generation;
 
     private AnonState() {}
 
@@ -52,6 +53,7 @@ final class AnonState {
     }
 
     static synchronized void arm() {
+        generation++;
         aliases.clear();
         nameAliases.clear();
         aliasCounter = 0;
@@ -71,6 +73,14 @@ final class AnonState {
         if (failureMarkerFile != null && failureMarkerFile.isFile()) failureMarkerFile.delete();
         persist();
         AFLog.i("Anonymous forwarding disarmed");
+    }
+
+    static synchronized long generation() { return generation; }
+
+    static synchronized Map<String, String> aliasSnapshot() {
+        Map<String, String> snapshot = new HashMap<>(aliases);
+        for (Map.Entry<String, String> entry : nameAliases.entrySet()) snapshot.put("name:" + entry.getKey(), entry.getValue());
+        return snapshot;
     }
 
     static synchronized boolean isArmed() {

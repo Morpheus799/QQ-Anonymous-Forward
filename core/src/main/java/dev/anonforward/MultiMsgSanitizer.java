@@ -6,6 +6,9 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
+import java.security.SecureRandom;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.zip.DeflaterOutputStream;
@@ -15,6 +18,8 @@ import java.util.zip.InflaterInputStream;
 
 final class MultiMsgSanitizer {
     private static final Pattern VISIBLE_MENTION = Pattern.compile("@([^\\s@，。！？、:：]+)");
+    private static final SecureRandom RANDOM = new SecureRandom();
+    private static final int MAX_EXPANDED_BYTES = 16 * 1024 * 1024;
 
     private MultiMsgSanitizer() {}
 
@@ -27,6 +32,7 @@ final class MultiMsgSanitizer {
         if (gzipPayload == null) throw new IllegalArgumentException("SsoSendLongMsg payload is missing");
 
         ProtoMessage longMessage = ProtoMessage.parse(gunzip(gzipPayload));
+        RewriteContext context = new RewriteContext();
         int bodyCount = 0;
         for (ProtoMessage.Field actionField : longMessage.all(2)) {
             ProtoMessage action = ProtoMessage.parse(actionField.bytes);
@@ -34,29 +40,35 @@ final class MultiMsgSanitizer {
             if (actionData == null) continue;
             for (ProtoMessage.Field bodyField : actionData.all(1)) {
                 ProtoMessage body = ProtoMessage.parse(bodyField.bytes);
-                sanitizeMessageBody(body);
+                sanitizeMessageBody(body, context, 0);
                 bodyField.bytes = body.toByteArray();
                 bodyCount++;
             }
             action.setBytes(2, actionData.toByteArray());
             actionField.bytes = action.toByteArray();
         }
+        if (bodyCount == 0) throw new IllegalArgumentException("No message bodies were anonymized");
         info.setBytes(4, gzip(longMessage.toByteArray()));
         request.setBytes(2, info.toByteArray());
         if (bodyCount > 0) AnonState.markPacketSanitized();
+        if (bodyCount > 0) ForwardCacheHook.onSanitizedUpload();
         AFLog.i("Sanitized SsoSendLongMsg bodies=" + bodyCount);
         return framing.wrap(request.toByteArray());
     }
 
-    private static void sanitizeMessageBody(ProtoMessage body) {
+    private static SyntheticIds sanitizeMessageBody(ProtoMessage body, RewriteContext context, int depth) throws Exception {
+        if (depth > 16) throw new IllegalArgumentException("Reply nesting exceeds limit");
         ProtoMessage responseHead = parseChild(body, 1);
+        ProtoMessage contentHead = parseChild(body, 2);
+        SyntheticIds ids = context.identity(responseHead, contentHead);
+        String alias = null;
         if (responseHead != null) {
             String uid = responseHead.string(2);
             long uin = responseHead.varint(1, 0);
             ProtoMessage group = parseChild(responseHead, 8);
             ProtoMessage forward = parseChild(responseHead, 7);
             String name = group != null ? group.string(4) : forward != null ? forward.string(6) : "QQ用户";
-            String alias = AnonState.aliasFor(uid, uin, name);
+            alias = AnonState.aliasFor(uid, uin, name);
             responseHead.setVarint(1, AnonState.PLACEHOLDER_UIN);
             responseHead.setString(2, AnonState.PLACEHOLDER_UID);
             responseHead.setVarint(5, 0);
@@ -74,10 +86,10 @@ final class MultiMsgSanitizer {
             body.setBytes(1, responseHead.toByteArray());
         }
 
-        ProtoMessage contentHead = parseChild(body, 2);
         if (contentHead != null) {
-            contentHead.setVarint(5, AnonState.nextSyntheticSequence());
-            if (contentHead.first(12) != null) contentHead.setVarint(12, AnonState.nextSyntheticMessageId());
+            contentHead.setVarint(5, ids.sequence);
+            if (contentHead.first(4) != null) contentHead.setVarint(4, ids.random);
+            if (contentHead.first(12) != null) contentHead.setVarint(12, ids.messageId);
             ProtoMessage forward = parseChild(contentHead, 15);
             if (forward != null) {
                 forward.remove(5);
@@ -91,26 +103,35 @@ final class MultiMsgSanitizer {
         if (payload != null) {
             ProtoMessage richText = parseChild(payload, 1);
             if (richText != null) {
-                sanitizeRichText(richText);
+                sanitizeRichText(richText, alias, context, depth);
                 payload.setBytes(1, richText.toByteArray());
             }
             body.setBytes(3, payload.toByteArray());
         }
+        return ids;
     }
 
-    private static void sanitizeRichText(ProtoMessage richText) {
+    private static void sanitizeRichText(ProtoMessage richText, String alias, RewriteContext context, int depth) throws Exception {
+        // Optional legacy typography includes its own random/time/reserve fields.
+        richText.remove(1);
+        ProtoMessage voice = parseChild(richText, 4);
+        if (voice != null) {
+            if (voice.first(2) != null) voice.setVarint(2, AnonState.PLACEHOLDER_UIN);
+            richText.setBytes(4, voice.toByteArray());
+        }
         for (ProtoMessage.Field elementField : richText.all(2)) {
-            try {
-                ProtoMessage element = ProtoMessage.parse(elementField.bytes);
-                sanitizeElement(element);
-                elementField.bytes = element.toByteArray();
-            } catch (Exception e) {
-                AFLog.e("Failed to sanitize rich-text element", e);
-            }
+            ProtoMessage element = ProtoMessage.parse(elementField.bytes);
+            sanitizeElement(element, alias, context, depth);
+            if (element.fields().isEmpty()) richText.removeField(elementField);
+            else elementField.bytes = element.toByteArray();
         }
     }
 
-    private static void sanitizeElement(ProtoMessage element) throws Exception {
+    private static void sanitizeElement(ProtoMessage element, String alias, RewriteContext context, int depth) throws Exception {
+        // ElemFlags2 is metadata: original msgId, bubble/font/VIP, instance/location identifiers.
+        element.remove(9);
+        // QQ anonymous-group profile contains a separate nick/id/avatar/bubble, no message content.
+        element.remove(21);
         ProtoMessage text = parseChild(element, 1);
         if (text != null) {
             sanitizeText(text);
@@ -119,19 +140,21 @@ final class MultiMsgSanitizer {
 
         ProtoMessage extraInfo = parseChild(element, 16);
         if (extraInfo != null) {
-            if (extraInfo.first(9) != null) extraInfo.setVarint(9, AnonState.PLACEHOLDER_UIN);
+            String extraAlias = alias != null ? alias : AnonState.aliasFor(null, extraInfo.varint(9, 0),
+                    extraInfo.string(2) != null ? extraInfo.string(2) : extraInfo.string(1));
+            MessageMetadataSanitizer.extraInfo(extraInfo, extraAlias);
             element.setBytes(16, extraInfo.toByteArray());
         }
 
         ProtoMessage generalFlags = parseChild(element, 37);
         if (generalFlags != null) {
-            if (generalFlags.first(3) != null) generalFlags.setVarint(3, AnonState.PLACEHOLDER_UIN);
+            MessageMetadataSanitizer.generalFlags(generalFlags);
             element.setBytes(37, generalFlags.toByteArray());
         }
 
         ProtoMessage source = parseChild(element, 45);
         if (source != null) {
-            sanitizeSourceMessage(source);
+            sanitizeSourceMessage(source, context, depth + 1);
             element.setBytes(45, source.toByteArray());
         }
 
@@ -208,44 +231,49 @@ final class MultiMsgSanitizer {
         return output.toString();
     }
 
-    private static void sanitizeSourceMessage(ProtoMessage source) {
-        long sequence = AnonState.nextSyntheticSequence();
+    private static void sanitizeSourceMessage(ProtoMessage source, RewriteContext context, int depth) throws Exception {
+        if (depth > 16) throw new IllegalArgumentException("Reply nesting exceeds limit");
+        ProtoMessage reserve = parseChild(source, 8);
+        if (reserve == null) reserve = new ProtoMessage();
+        ProtoMessage sourceMessage = parseChild(source, 9);
+        String alias;
+        SyntheticIds ids;
+        if (sourceMessage != null) {
+            ids = sanitizeMessageBody(sourceMessage, context, depth);
+            ProtoMessage head = parseChild(sourceMessage, 1);
+            ProtoMessage group = head == null ? null : parseChild(head, 8);
+            ProtoMessage forward = head == null ? null : parseChild(head, 7);
+            alias = group != null ? group.string(4) : forward != null ? forward.string(6) : null;
+            source.setBytes(9, sourceMessage.toByteArray());
+        } else {
+            ids = context.sparseReply(source, reserve);
+            alias = AnonState.aliasFor(reserve.string(6), source.varint(2, 0), "QQ用户");
+        }
         source.remove(1);
-        source.setVarint(1, sequence);
+        source.setVarint(1, ids.sequence);
         source.setVarint(2, AnonState.PLACEHOLDER_UIN);
         source.setVarint(10, 0);
         source.remove(11);
         for (ProtoMessage.Field elementField : source.all(5)) {
-            try {
-                ProtoMessage element = ProtoMessage.parse(elementField.bytes);
-                sanitizeElement(element);
-                elementField.bytes = element.toByteArray();
-            } catch (Exception e) {
-                AFLog.e("Failed to sanitize srcMsg element", e);
-            }
+            ProtoMessage element = ProtoMessage.parse(elementField.bytes);
+            sanitizeElement(element, alias, context, depth);
+            if (element.fields().isEmpty()) source.removeField(elementField);
+            else elementField.bytes = element.toByteArray();
         }
-        ProtoMessage reserve = parseChild(source, 8);
-        if (reserve == null) reserve = new ProtoMessage();
-        reserve.setVarint(3, AnonState.nextSyntheticMessageId());
+        reserve.setVarint(3, ids.messageId);
         reserve.setString(6, AnonState.PLACEHOLDER_UID);
         reserve.setString(7, AnonState.PLACEHOLDER_UID);
-        reserve.setVarint(8, sequence);
+        reserve.setVarint(8, ids.sequence);
         source.setBytes(8, reserve.toByteArray());
-        ProtoMessage sourceMessage = parseChild(source, 9);
-        if (sourceMessage != null) {
-            sanitizeMessageBody(sourceMessage);
-            source.setBytes(9, sourceMessage.toByteArray());
-        }
     }
 
     private static ProtoMessage parseChild(ProtoMessage parent, int field) {
         byte[] bytes = parent.bytes(field);
-        if (bytes == null) return null;
-        try {
-            return ProtoMessage.parse(bytes);
-        } catch (IllegalArgumentException ignored) {
+        if (bytes == null) {
+            if (parent.first(field) != null) throw new IllegalArgumentException("Wrong wire type for message field " + field);
             return null;
         }
+        return ProtoMessage.parse(bytes);
     }
 
     private static byte[] gunzip(byte[] data) throws Exception {
@@ -276,7 +304,10 @@ final class MultiMsgSanitizer {
         ByteArrayOutputStream output = new ByteArrayOutputStream();
         byte[] buffer = new byte[8192];
         int count;
-        while ((count = input.read(buffer)) >= 0) output.write(buffer, 0, count);
+        while ((count = input.read(buffer)) >= 0) {
+            if (output.size() + count > MAX_EXPANDED_BYTES) throw new IllegalArgumentException("Expanded message exceeds limit");
+            output.write(buffer, 0, count);
+        }
         return output.toByteArray();
     }
 
@@ -289,9 +320,39 @@ final class MultiMsgSanitizer {
         }
         if (raw.length > 4 && raw[0] == 0) {
             int declared = ByteBuffer.wrap(raw, 0, 4).order(ByteOrder.BIG_ENDIAN).getInt();
+            if (declared != raw.length && declared != raw.length - 4) throw new IllegalArgumentException("Invalid packet length prefix");
             return new Framing(raw, Arrays.copyOfRange(raw, 4, raw.length), true, declared);
         }
         throw new IllegalArgumentException("Unknown SsoSendLongMsg framing");
+    }
+
+    private record SyntheticIds(long sequence, long messageId, long random) {}
+
+    private static final class RewriteContext {
+        final Map<String, SyntheticIds> identities = new HashMap<>();
+
+        SyntheticIds identity(ProtoMessage head, ProtoMessage content) {
+            if (head == null || content == null) return create(0);
+            ProtoMessage group = parseChild(head, 8);
+            String sender = head.string(2) != null ? head.string(2) : Long.toUnsignedString(head.varint(1, 0));
+            long sequence = content.varint(5, 0), random = content.varint(4, 0), id = content.varint(12, 0);
+            if (sequence == 0 && random == 0 && id == 0) return create(random);
+            String key = sender + ":" + (group == null ? head.varint(5, 0) : group.varint(1, 0))
+                    + ":" + sequence + ":" + random + ":" + id;
+            return identities.computeIfAbsent(key, ignored -> create(random));
+        }
+
+        SyntheticIds sparseReply(ProtoMessage source, ProtoMessage reserve) {
+            String key = "reply:" + source.varint(2, 0) + ":" + reserve.string(6)
+                    + ":" + source.varint(1, 0) + ":" + reserve.varint(3, 0);
+            return identities.computeIfAbsent(key, ignored -> create(0));
+        }
+
+        private SyntheticIds create(long oldRandom) {
+            long random;
+            do { random = Integer.toUnsignedLong(RANDOM.nextInt()); } while (random == 0 || random == oldRandom);
+            return new SyntheticIds(AnonState.nextSyntheticSequence(), AnonState.nextSyntheticMessageId(), random);
+        }
     }
 
     private static final class Framing {

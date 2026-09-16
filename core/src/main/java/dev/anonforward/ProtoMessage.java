@@ -79,6 +79,7 @@ final class ProtoMessage {
         Field field = first(number);
         if (field != null && field.wireType == 0) {
             field.varint = value;
+            fields.removeIf(other -> other.number == number && other != field);
             return;
         }
         remove(number);
@@ -91,6 +92,7 @@ final class ProtoMessage {
         Field field = first(number);
         if (field != null && field.wireType == 2) {
             field.bytes = value;
+            fields.removeIf(other -> other.number == number && other != field);
             return;
         }
         remove(number);
@@ -113,6 +115,8 @@ final class ProtoMessage {
             if (iterator.next().number == number) iterator.remove();
         }
     }
+
+    void removeField(Field field) { fields.remove(field); }
 
     byte[] toByteArray() {
         ByteArrayOutputStream out = new ByteArrayOutputStream();

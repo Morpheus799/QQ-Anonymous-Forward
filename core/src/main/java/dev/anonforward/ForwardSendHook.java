@@ -69,6 +69,7 @@ final class ForwardSendHook {
 
         @Override
         public void beforeHookedMember(HookBridge.MemberHookParam param) {
+            ForwardCacheHook.beforeForward(param);
             if (!AnonState.isArmed()) return;
             if (param.getMember().getName().toLowerCase(Locale.ROOT).contains("multiforward")) {
                 AnonState.markForwardStarted();

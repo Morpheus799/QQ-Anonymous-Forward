@@ -26,6 +26,7 @@ public final class AnonForwardCore {
         try {
             AFLog.i("Loading " + owner + " in process " + process);
             AnonState.initialize(hostDataDir);
+            if (isMainProcess(process)) ForwardCacheHook.install(hostDataDir);
             NativeSsoHook.install(hostContext);
             PacketSendHook.install();
             ArkSendHook.install();
@@ -46,6 +47,7 @@ public final class AnonForwardCore {
                 + ", nativePacket=" + NativeSsoHook.hookCount()
                 + ", sendMsg=" + ArkSendHook.hookCount()
                 + ", forward=" + ForwardSendHook.hookCount()
+                + ", cache=" + ForwardCacheHook.hookCount()
                 + ", menu=" + MultiSelectMenuHook.hookCount();
     }
 

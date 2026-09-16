@@ -85,6 +85,7 @@ final class PacketSendHook {
                 } catch (Throwable error) {
                     AnonState.markPacketFailed();
                     AFLog.e("Failed to sanitize outgoing long message", error);
+                    param.setResult(null);
                 }
                 return;
             }
